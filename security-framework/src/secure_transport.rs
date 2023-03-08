@@ -133,6 +133,24 @@ impl SslConnectionType {
     pub const DATAGRAM: Self = Self(kSSLDatagramType);
 }
 
+/// SSL Pinning Mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SSLPinningMode {
+    /// Do not used pinned certificates to validate servers.
+    None,
+    /// Validate host certificates against pinned certificates.
+    Certificate,
+}
+
+/// Handshake Mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeMode {
+    /// Original way
+    Default,
+    /// According to the settings of Pinning Mode
+    PinningMode,
+}
+
 /// An error or intermediate state after a TLS handshake attempt.
 #[derive(Debug)]
 pub enum HandshakeError<S> {
@@ -239,6 +257,8 @@ pub struct MidHandshakeClientBuilder<S> {
     certs: Vec<SecCertificate>,
     trust_certs_only: bool,
     danger_accept_invalid_certs: bool,
+    handshake_mode: HandshakeMode,
+    ssl_pinning_mode: SSLPinningMode,
 }
 
 impl<S> MidHandshakeClientBuilder<S> {
@@ -262,12 +282,23 @@ impl<S> MidHandshakeClientBuilder<S> {
 
     /// Restarts the handshake process.
     pub fn handshake(self) -> result::Result<SslStream<S>, ClientHandshakeError<S>> {
+        match self.handshake_mode {
+            HandshakeMode::Default => self.handshake_default(),
+            HandshakeMode::PinningMode => self.handshake_pinning(),
+        }
+    }
+
+
+    /// Restarts the handshake process.
+    fn handshake_default(self) -> result::Result<SslStream<S>, ClientHandshakeError<S>> {
         let MidHandshakeClientBuilder {
             stream,
             domain,
             certs,
             trust_certs_only,
             danger_accept_invalid_certs,
+            handshake_mode,
+            ssl_pinning_mode
         } = self;
 
         let mut result = stream.handshake();
@@ -287,6 +318,8 @@ impl<S> MidHandshakeClientBuilder<S> {
                     certs,
                     trust_certs_only,
                     danger_accept_invalid_certs,
+                    handshake_mode,
+                    ssl_pinning_mode,
                 };
                 return Err(ClientHandshakeError::Interrupted(ret));
             }
@@ -314,6 +347,97 @@ impl<S> MidHandshakeClientBuilder<S> {
                 })?;
                 result = stream.handshake();
                 continue;
+            }
+
+            let err = Error::from_code(stream.error().code());
+            return Err(ClientHandshakeError::Failure(err));
+        }
+    }
+
+    /// Restarts the handshake process.
+    fn handshake_pinning(self) -> result::Result<SslStream<S>, ClientHandshakeError<S>> {
+        let MidHandshakeClientBuilder {
+            stream,
+            domain,
+            certs,
+            trust_certs_only,
+            danger_accept_invalid_certs,
+            handshake_mode,
+            ssl_pinning_mode,
+        } = self;
+
+        let mut result = stream.handshake();
+        loop {
+            let stream = match result {
+                Ok(stream) => return Ok(stream),
+                Err(HandshakeError::Interrupted(stream)) => stream,
+                Err(HandshakeError::Failure(err)) => {
+                    return Err(ClientHandshakeError::Failure(err))
+                }
+            };
+
+            if stream.would_block() {
+                let ret = MidHandshakeClientBuilder {
+                    stream,
+                    domain,
+                    certs,
+                    trust_certs_only,
+                    danger_accept_invalid_certs,
+                    handshake_mode,
+                    ssl_pinning_mode
+                };
+                return Err(ClientHandshakeError::Interrupted(ret));
+            }
+
+            if stream.server_auth_completed() {
+                let mut trust = match stream.context().peer_trust2()? {
+                    Some(trust) => trust,
+                    None => {
+                        result = stream.handshake();
+                        continue;
+                    }
+                };
+                let policy = match domain {
+                    Some(_) => SecPolicy::create_ssl(SslProtocolSide::SERVER, domain.as_deref()),
+                    None => SecPolicy::create_x509(),
+                };
+                trust.set_policy(&policy)?;
+
+                if ssl_pinning_mode == SSLPinningMode::None {
+                    if danger_accept_invalid_certs || trust.evaluate_with_error().is_ok() {
+                        result = stream.handshake();
+                        continue;
+                    }
+                } else if !danger_accept_invalid_certs {
+                    trust.evaluate_with_error().map_err(|error| {
+                        Error::from_code(error.code() as _)
+                    })?;
+                }
+
+                match ssl_pinning_mode {
+                    SSLPinningMode::Certificate => {
+                        trust.set_anchor_certificates(&certs)?;
+                        trust.evaluate_with_error().map_err(|error| {
+                            Error::from_code(error.code() as _)
+                        })?;
+
+                        let certs_der = certs.iter().map(|c| c.to_der()).collect::<Vec<_>>();
+                        let server_cer = trust.certificate_trust_chain_for_server_trust();
+                        let mut has = false;
+                        for sc in server_cer {
+                            let sc_der = sc.to_der();
+                            if certs_der.contains(&sc_der) {
+                                has = true;
+                                break;
+                            }
+                        }
+                        if has {
+                            result = stream.handshake();
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
             }
 
             let err = Error::from_code(stream.error().code());
@@ -1192,6 +1316,8 @@ pub struct ClientBuilder {
     alpn: Option<Vec<String>>,
     #[cfg(feature = "session-tickets")]
     enable_session_tickets: bool,
+    handshake_mode: HandshakeMode,
+    ssl_pinning_mode: SSLPinningMode,
 }
 
 impl Default for ClientBuilder {
@@ -1221,7 +1347,24 @@ impl ClientBuilder {
             alpn: None,
             #[cfg(feature = "session-tickets")]
             enable_session_tickets: false,
+            handshake_mode: HandshakeMode::Default,
+            ssl_pinning_mode: SSLPinningMode::Certificate
         }
+    }
+
+    /// 设置握手方式，默认为 HandshakeMode::Default
+    #[inline]
+    pub fn set_handshake_mode(&mut self, mode: HandshakeMode) -> &mut Self {
+        self.handshake_mode = mode;
+        self
+    }
+
+    /// 当为 HandshakeMode::PinningMode 时，改设置项目生效
+    /// 默认为 SSLPinningMode::Certificate
+    #[inline]
+    pub fn set_ssl_pinning_mode(&mut self, mode: SSLPinningMode) -> &mut Self {
+        self.ssl_pinning_mode = mode;
+        self
     }
 
     /// Specifies the set of root certificates to trust when
@@ -1364,6 +1507,8 @@ impl ClientBuilder {
             certs,
             trust_certs_only: self.trust_certs_only,
             danger_accept_invalid_certs: self.danger_accept_invalid_certs,
+            handshake_mode: self.handshake_mode,
+            ssl_pinning_mode: self.ssl_pinning_mode,
         };
         stream.handshake()
     }

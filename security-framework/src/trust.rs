@@ -285,6 +285,22 @@ impl SecTrust {
             }
         }
     }
+
+    /// Returns a specific certificate from the certificate chain used to evaluate trust.
+    ///
+    /// Note: evaluate must first be called on the SecTrust. 
+    pub fn certificate_trust_chain_for_server_trust(&self) -> Vec<SecCertificate> {
+        let count = self.certificate_count();
+        let  mut cers = Vec::with_capacity(count as _);
+        for ix in 0..count {
+            #[allow(deprecated)]
+            unsafe {
+                let certificate = SecTrustGetCertificateAtIndex(self.0, ix);
+                cers.push(SecCertificate::wrap_under_get_rule(certificate as *mut _));
+            }            
+        }
+        cers
+    }
 }
 
 #[cfg(not(any(feature = "OSX_10_14", target_os = "ios")))]
